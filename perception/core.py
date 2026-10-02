@@ -1,6 +1,8 @@
 """NPC 感知：视野锥、视线遮挡、听觉半径与记忆时长。
 
-缺陷：不看视野锥、不查遮挡、没有听觉、记忆不过期、每次观察扫描全部单位。
+实现口径见 README：视野锥按 fov_deg/2 判定，墙体线段遮挡视线，
+听觉只看阵营与半径，记忆超过 memory_ms 过期；observe 走空间网格，
+不遍历全部单位。
 """
 
 import math
@@ -25,6 +27,11 @@ def _segments_hit(a, b, c, d):
     return False
 
 
+def _angle_diff(a, b):
+    """两个方向角（度）的最小夹角，范围 [0, 180]。"""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
 class Perception:
     """一个 NPC 的感知台账。"""
 
@@ -38,14 +45,31 @@ class Perception:
         self.seen_at = {}
         self.heard_at = {}
         self.scanned = 0
+        self._cell_size = max(float(view_range), float(hear_range), 1.0)
+        self._grid = {}
+        self._cell_of = {}
+
+    def _cell(self, x, y):
+        return (int(math.floor(x / self._cell_size)),
+                int(math.floor(y / self._cell_size)))
 
     def add(self, eid, x, y, team=0, facing=0.0):
+        if eid in self.entities:
+            self._grid[self._cell_of[eid]].discard(eid)
         self.entities[eid] = {"id": eid, "x": x, "y": y, "team": team, "facing": facing}
+        cell = self._cell(x, y)
+        self._cell_of[eid] = cell
+        self._grid.setdefault(cell, set()).add(eid)
 
     def move(self, eid, x, y):
         if eid in self.entities:
             self.entities[eid]["x"] = x
             self.entities[eid]["y"] = y
+            cell = self._cell(x, y)
+            if cell != self._cell_of[eid]:
+                self._grid[self._cell_of[eid]].discard(eid)
+                self._cell_of[eid] = cell
+                self._grid.setdefault(cell, set()).add(eid)
 
     def set_facing(self, eid, deg):
         self.entities[eid]["facing"] = deg
@@ -53,28 +77,72 @@ class Perception:
     def add_wall(self, x1, y1, x2, y2):
         self.walls.append(((x1, y1), (x2, y2)))
 
+    def _occluded(self, a, b):
+        for c, d in self.walls:
+            if _segments_hit(a, b, c, d):
+                return True
+        return False
+
+    def _in_cone(self, observer, dx, dy, distance):
+        if distance == 0 or self.fov >= 360:
+            return True
+        bearing = math.degrees(math.atan2(dy, dx))
+        return _angle_diff(bearing, observer["facing"]) <= self.fov / 2.0
+
+    def _candidates(self, x, y, radius):
+        cell = self._cell_size
+        min_cx = int(math.floor((x - radius) / cell))
+        max_cx = int(math.floor((x + radius) / cell))
+        min_cy = int(math.floor((y - radius) / cell))
+        max_cy = int(math.floor((y + radius) / cell))
+        for cx in range(min_cx, max_cx + 1):
+            for cy in range(min_cy, max_cy + 1):
+                for eid in self._grid.get((cx, cy), ()):
+                    yield eid
+
     def observe(self, observer_id, now_ms):
-        """更新一次感知。"""
-        self.scanned += len(self.entities)
+        """更新一次感知：只扫描观察者感知半径覆盖的网格。"""
         observer = self.entities[observer_id]
-        for target_id, target in self.entities.items():
-            if target_id == observer_id or target["team"] == observer["team"]:
+        ox, oy = observer["x"], observer["y"]
+        radius = max(self.view_range, self.hear_range)
+        for target_id in self._candidates(ox, oy, radius):
+            self.scanned += 1
+            if target_id == observer_id:
                 continue
-            distance = math.hypot(target["x"] - observer["x"], target["y"] - observer["y"])
-            if distance <= self.view_range:
-                self.seen_at[(observer_id, target_id)] = now_ms
+            target = self.entities[target_id]
+            if target["team"] == observer["team"]:
+                continue
+            dx = target["x"] - ox
+            dy = target["y"] - oy
+            distance = math.hypot(dx, dy)
+            if distance <= self.hear_range:
+                self.heard_at[(observer_id, target_id)] = now_ms
+            if distance <= self.view_range and self._in_cone(observer, dx, dy, distance):
+                if not self._occluded((ox, oy), (target["x"], target["y"])):
+                    self.seen_at[(observer_id, target_id)] = now_ms
+
+    def _fresh(self, table, key, now_ms):
+        ts = table.get(key)
+        if ts is None:
+            return False
+        if now_ms - ts > self.memory_ms:
+            del table[key]
+            return False
+        return True
 
     def seen(self, observer_id, target_id, now_ms=0):
-        return (observer_id, target_id) in self.seen_at
+        return self._fresh(self.seen_at, (observer_id, target_id), now_ms)
 
     def heard(self, observer_id, target_id, now_ms=0):
-        return (observer_id, target_id) in self.heard_at
+        return self._fresh(self.heard_at, (observer_id, target_id), now_ms)
 
     def contacts(self, observer_id, now_ms=0):
-        out = []
-        for (obs, target), _ in self.seen_at.items():
-            if obs == observer_id:
-                out.append(target)
+        out = set()
+        for table in (self.seen_at, self.heard_at):
+            for key in list(table):
+                obs, target = key
+                if obs == observer_id and self._fresh(table, key, now_ms):
+                    out.add(target)
         return sorted(out)
 
     def scanned_count(self):
